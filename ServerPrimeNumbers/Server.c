@@ -9,8 +9,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
+#include "../Command.h"
 
-#define BUFSIZE 32
 #define MAXCLIENTS 16
 #define UINTNUMBYTES 4
 
@@ -32,10 +32,9 @@ HANDLE mutex; //Мьютекс для контроля доступа к глобальным переменным связанным с
 unsigned __int32 *primes = NULL, //Список простых чисел
 	*tmpPrimes = NULL,
 	numPrimes = 0, //Количество предвычисленных простых чисел
-	maxPreCalcNum = 0, //Максимальное число для которого уже вычислялись простые числа
-	numRequests = 0; //Число запросов обработанных сервером
+	maxPreCalcNum = 0; //Максимальное число для которого уже вычислялись простые числа
 
-float allProcessTime = 0.0; //Суммарное время обработки запросов
+Statistics stat = { 0, 0, 0.0 };
 					
 //Функции подготавливает систему к аварийному завершению работы
 int ProcessErrorExit(SOCKET socket);
@@ -181,30 +180,32 @@ int GetFreeSocket()
 
 int ClientProcess(LPVOID ptrID)
 {
-	char buffer[BUFSIZE];
-	int result, sumresult, id = *(int*)ptrID;
-
+	int id = *(int*)ptrID;
 	unsigned __int32 resNumPrimes, //Количество нужных клиенту простых чисел
-		maxNum; //Число до которого нужно получить простые числа
+		result, sumresult, packetSize;
+	float processTime;
+
+	Command command;//Принимаемая комманда
 
 	clock_t t1, t2;
-	float t_diff; //Метки времени
+
+	char *packetPrimes = NULL;
+
 
 	while (1){
 		//Получение команды
-		ZeroMemory(&buffer, sizeof(buffer));
-		result = recv(clientSocket[id], buffer, BUFSIZE, 0);
+		result = recv(clientSocket[id], (char *)&command, sizeof(Command), 0);
 		if (result == SOCKET_ERROR || result == 0)
 		{
 			ProcessClientErrorExit(id);
 			break;
 		}
 
-		printf("Клиент[IPv4: %s;Порт: %d;ID: %d] отправил комманду '%s'\n",
-			inet_ntoa(clientAddr[id].sin_addr), clientAddr[id].sin_port, id, buffer);
+		printf("Клиент[IPv4: %s;Порт: %d;ID: %d] отправил комманду '%c %u' c id %u\n",
+			inet_ntoa(clientAddr[id].sin_addr), clientAddr[id].sin_port, id, command.type, command.data, command.id);
 
 		//Если клиент хочет получить список простых чисел
-		if (sscanf_s(buffer, "prim %u", &maxNum) == 1)
+		if (command.type == PRIM)
 		{
 			t1 = clock();
 			WaitForSingleObject(mutex, INFINITE); //Берём под контроль мьютекс
@@ -212,9 +213,10 @@ int ClientProcess(LPVOID ptrID)
 			//Фукнция возвращает число простых чисел до определённого числа
 			//Единицу от результата отнимаем так как самое первое число в массиве - '1' не является простым,
 			//но требуется для простоты алгоритма
-			resNumPrimes = CalculatePrimes(maxNum) - 1;
+			resNumPrimes = CalculatePrimes(command.data) - 1;
 			ReleaseMutex(mutex);
 			t2 = clock();
+			processTime = (float)(t2 - t1) / CLK_TCK;//Подсчёт времени обработки запроса
 
 			//Функция вернёт данное число если во время выполнения возникнёт проблемы с памятью
 			if (resNumPrimes == 0xfffffffe)
@@ -223,56 +225,48 @@ int ClientProcess(LPVOID ptrID)
 				break;
 			}
 
-			//Посылаем количество простых чисел
-			result = send(clientSocket[id], (const char *)&resNumPrimes, UINTNUMBYTES, 0);
-			if (result == SOCKET_ERROR)
+			//Заполнение пакета
+			packetSize = UINTNUMBYTES + UINTNUMBYTES + resNumPrimes * UINTNUMBYTES + sizeof(float);
+			packetPrimes = malloc(packetSize);
+			if (packetPrimes == NULL)
 			{
 				ProcessClientErrorExit(id);
 				break;
 			}
+			memcpy(packetPrimes, (void*)&command.id, UINTNUMBYTES); //Упаковка id
+			memcpy(&packetPrimes[UINTNUMBYTES], (void*)&resNumPrimes, UINTNUMBYTES); //Упаковка количества простых чисел
+			memcpy(&packetPrimes[2 * UINTNUMBYTES], (void*)&primes[1], resNumPrimes * UINTNUMBYTES); //Упаковка списка простых чисел
+			memcpy(&packetPrimes[packetSize - sizeof(float)], (void*)&processTime, sizeof(float)); //Упаковка времени обработки запроса
 
 			//Посылаем список простых чисел, т.к. он может быть большим то в цикле
 			sumresult = 0;
-			while ((unsigned)sumresult < resNumPrimes * UINTNUMBYTES)
+			while (sumresult < packetSize)
 			{
-				result = send(clientSocket[id], (const char *)&primes[sumresult / UINTNUMBYTES + 1],
-								resNumPrimes * UINTNUMBYTES - sumresult, 0);
+				result = send(clientSocket[id], &packetPrimes[sumresult], packetSize - sumresult, 0);
 				if (result == SOCKET_ERROR)
 				{
 					ProcessClientErrorExit(id);
 					break;
 				}
-				printf("Клиенту[IPv4: %s;Порт: %d;ID: %d] отправлен список весом %d байт\n",
+				printf("Клиенту[IPv4: %s;Порт: %d;ID: %d] отправлен список весом %u байт\n",
 					inet_ntoa(clientAddr[id].sin_addr), clientAddr[id].sin_port, id, result);
 				sumresult += result;
 			}
 
-			//Посылаем время обработки запроса
-			t_diff = (float)(t2 - t1) / CLK_TCK;
-			result = send(clientSocket[id], (const char *)&t_diff, sizeof(float), 0);
-			if (result == SOCKET_ERROR)
-			{
-				ProcessClientErrorExit(id);
-				break;
-			}
+			free(packetPrimes);
 
-			allProcessTime += t_diff;
-			numRequests++;
+			//Обновляем статистику
+			WaitForSingleObject(mutex, INFINITE); //Берём под контроль мьютекс
+			stat.aveProcessTime = (stat.aveProcessTime * stat.numRequests + processTime) / (stat.numRequests + 1);
+			stat.numRequests++;
+			ReleaseMutex(mutex);
 		}
 		//Если получена команда вывода статистики
-		else if (!strncmp(buffer, "stat", 4))
+		else if (command.type == STAT)
 		{
-			//Посылаем общее число запросов
-			result = send(clientSocket[id], (const char *)&numRequests, UINTNUMBYTES, 0);
-			if (result == SOCKET_ERROR)
-			{
-				ProcessClientErrorExit(id);
-				break;
-			}
+			stat.id = command.id;
 
-			//Посылаем среднее время обработки запроса
-			t_diff = (float)(numRequests ? allProcessTime / numRequests : 0.0);
-			result = send(clientSocket[id], (const char *)&t_diff, sizeof(float), 0);
+			result = send(clientSocket[id], (const char *)&stat, sizeof(Statistics), 0);
 			if (result == SOCKET_ERROR)
 			{
 				ProcessClientErrorExit(id);
@@ -280,10 +274,10 @@ int ClientProcess(LPVOID ptrID)
 			}
 		}
 		else
-			printf("Неизвестная команда '%s'!\n", buffer);
+			printf("Неизвестная команда '%c %u'!\n", command.type, command.data);
 
-		printf("Комманда клиента[IPv4: %s;Порт: %d;ID: %d] '%s' обработана\n",
-			inet_ntoa(clientAddr[id].sin_addr), clientAddr[id].sin_port, id, buffer);
+		printf("Комманда клиента[IPv4: %s;Порт: %d;ID: %d] c id %u обработана\n",
+			inet_ntoa(clientAddr[id].sin_addr), clientAddr[id].sin_port, id, command.id);
 	}
 
 	shutdown(clientSocket[id], SD_SEND);
@@ -331,7 +325,7 @@ unsigned __int32  CalculatePrimes(unsigned __int32 maxNum)
 		
 		//Цикл отсеивания простыми числами выше предела для которого уже вычислялись простые числа
 		for (i = numPrimes ? maxPreCalcNum + 1 : 2; i <= sqrtMaxNum; i++)
-			if (isPrime[i - 1])
+			if (isPrime[i - maxPreCalcNum - 1])
 				for (j = i * i; j <= maxNum; j += i)
 					isPrime[j - maxPreCalcNum - 1] = 0;
 

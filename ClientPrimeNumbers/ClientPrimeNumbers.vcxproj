@@ -67,6 +67,9 @@
   <ItemGroup>
     <ClCompile Include="Client.c" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Command.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

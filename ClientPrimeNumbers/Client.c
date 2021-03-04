@@ -8,13 +8,19 @@
 #include <locale.h>
 #include <stdio.h>
 #include <string.h>
+#include "../Command.h"
 
 #define BUFSIZE 32
 #define UINTNUMBYTES 4
 
+unsigned __int32 id = 0;
+
 //Функции подготавливают систему к аварийному завершению работы
 int ProcessErrorExit(SOCKET socket);
 int ProcessServerErrorExit();
+//Функция преобразовывает строку в команду для передачи по сети и если это удаётся возвращает 1
+//если нет или если команда не предназначена для передачи по сети то возвращает 0
+int StringToCommand(const char *buffer, Command *command);
 
 int main(int argc, char **argv)
 {
@@ -29,16 +35,17 @@ int main(int argc, char **argv)
 
 	const char *srvport = "666";
 	char buffer[BUFSIZE], host[BUFSIZE] = "localhost";
+
 	const int timeout = 10000;
-	int result, sumresult;
+
+	Command command;
+	Statistics stat;
 
 	unsigned __int32 *primes = NULL, //Список простых чисел
 		numPrimes, //Количество простых чисел
-		numRequests, //Число запросов обработанных сервером
-		tmp;
+		result, sumresult, tmpId;
 
-	float aveProcessTime, //Среднее время обработки запроса
-		processTime; //Время обработки запроса
+	float processTime; //Время обработки запроса
 
 	//Обработка аргументов программы
 	if (argc == 2 && strcmp(argv[1], "/?"))
@@ -117,10 +124,10 @@ int main(int argc, char **argv)
 		ZeroMemory(&buffer, sizeof(buffer));
 		gets_s(buffer, BUFSIZE);
 
-		if ((sscanf_s(buffer, "prim %u", &tmp) == 1 && tmp >= 2 && tmp <= 100000000) || !strcmp(buffer, "stat"))
+		if (StringToCommand(buffer, &command))
 		{
 			//Отправка команды на сервер
-			result = send(connSocket, buffer, strlen(buffer), 0);
+			result = send(connSocket, (const char*)&command, sizeof(Command), 0);
 			if (result == SOCKET_ERROR)
 			{
 				printf("Сбой при отправке данных с кодом %d\n", WSAGetLastError());
@@ -129,13 +136,18 @@ int main(int argc, char **argv)
 		}
 
 		//Если отправлена команда для получения списка простых чисел
-		if (sscanf_s(buffer, "prim %u", &tmp) == 1)
+		if (command.type == PRIM)
 		{
-			if (tmp < 2 || tmp > 100000000)
+			if (command.data < 2 || command.data > 100000000)
 			{
 				printf("Число должно быть в диапазоне от 2 до 100000000\n");
 				continue;
 			}
+
+			//Получение id
+			result = recv(connSocket, (char *)&tmpId, UINTNUMBYTES, 0);
+			if (result == SOCKET_ERROR)
+				return ProcessServerErrorExit(connSocket);
 
 			//Получение количества простых чисел
 			result = recv(connSocket, (char *)&numPrimes, UINTNUMBYTES, 0);
@@ -158,7 +170,7 @@ int main(int argc, char **argv)
 								numPrimes * UINTNUMBYTES - sumresult, 0);
 				if (result == SOCKET_ERROR)
 					return ProcessServerErrorExit(connSocket);
-				printf("Принята часть списка весом %d байт\n", result);
+				printf("Принята часть списка весом %u байт\n", result);
 				sumresult += result;
 			}
 
@@ -169,7 +181,7 @@ int main(int argc, char **argv)
 
 
 			//Вывод результатов
-			printf("Время обработки запроса: %.3f секунд\n", processTime);
+			printf("Время обработки запроса с id %u: %.3f секунд\n", tmpId, processTime);
 			printf("Возвращён список из %u простых чисел. Вывести?(yes/no)\n", numPrimes);
 			gets_s(buffer, BUFSIZE);
 
@@ -183,23 +195,19 @@ int main(int argc, char **argv)
 			free(primes);
 		}
 		//Если отправлена команда для получения статистики
-		else if (!strcmp(buffer, "stat"))
+		else if (command.type == STAT)
 		{
 			//Получение числа запросов обработанных сервером
-			result = recv(connSocket, (char *)&numRequests, UINTNUMBYTES, 0);
-			if (result == SOCKET_ERROR)
-				return ProcessServerErrorExit(connSocket);
-
-			//Получение среднего времени обработки запроса
-			result = recv(connSocket, (char *)&aveProcessTime, sizeof(float), 0);
+			result = recv(connSocket, (char *)&stat, sizeof(Statistics), 0);
 			if (result == SOCKET_ERROR)
 				return ProcessServerErrorExit(connSocket);
 
 			//Вывод результатов
-			printf("Число запросов обработанных сервером: %u\n", numRequests);
-			printf("Среднее время обработки запроса: %.3f секунд\n", aveProcessTime);
+			printf("Ответ на запрос статистики с id %u\n", stat.id);
+			printf("Число запросов обработанных сервером: %u\n", stat.numRequests);
+			printf("Среднее время обработки запроса: %.3f секунд\n", stat.aveProcessTime);
 		}
-		else if (!strcmp(buffer, "exit"))
+		else if (command.type == EXIT)
 			break;
 		else
 			printf("Неизвестная команда '%s'\n", buffer);
@@ -230,4 +238,35 @@ int ProcessServerErrorExit(SOCKET socket)
 		printf("Сбой при принятии данных произошёл с кодом %d\n", WSAGetLastError());
 
 	return ProcessErrorExit(socket);
+}
+
+int StringToCommand(const char *buffer, Command *command)
+{
+	unsigned __int32 tmp;
+
+	command->type = UNKNOWN;
+	command->id = id++;
+	command->data = 0;
+
+	if (sscanf_s(buffer, "prim %u", &tmp) == 1)
+	{
+		command->type = PRIM;
+		command->data = tmp;
+
+		return (tmp >= 2 && tmp <= 100000000) ? 1 : 0;
+	}
+	else if (!strcmp(buffer, "stat"))
+	{
+		command->type = STAT;
+
+		return 1;
+	}
+	else if (!strcmp(buffer, "exit"))
+	{
+		command->type = EXIT;
+
+		return 0;
+	}
+
+	return 0;
 }
